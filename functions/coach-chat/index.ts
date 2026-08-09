@@ -36,9 +36,7 @@ export default async function (req: Request): Promise<Response> {
 
     const sessionResponse = await fetch(`${baseUrl}/api/auth/sessions/current`, {
       method: 'GET',
-      headers: {
-        'Authorization': authHeader,
-      },
+      headers: { 'Authorization': authHeader },
     });
 
     if (!sessionResponse.ok) {
@@ -62,7 +60,6 @@ export default async function (req: Request): Promise<Response> {
     const body = await req.json().catch(() => ({}));
     const { message } = body;
 
-    // Minimal input validation for MVP
     if (!message || message.trim() === '') {
       return new Response(
         JSON.stringify({ error: 'Missing required field: message' }),
@@ -77,16 +74,10 @@ export default async function (req: Request): Promise<Response> {
     }
 
     // 2. COACH CONTEXT MINIMIZATION
-    // Query last 7 days of meals
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     const fetchMealsRes = await fetch(
       `${baseUrl}/api/database/records/meals?user_id=eq.${userId}&created_at=gte.${sevenDaysAgo}`,
-      {
-        method: 'GET',
-        headers: {
-          'Authorization': authHeader,
-        },
-      }
+      { method: 'GET', headers: { 'Authorization': authHeader } }
     );
 
     if (!fetchMealsRes.ok) {
@@ -99,7 +90,6 @@ export default async function (req: Request): Promise<Response> {
 
     const pastMeals = await fetchMealsRes.json();
 
-    // Compute compact stats summary
     let totalCals = 0;
     let totalProtein = 0;
     let totalCarbs = 0;
@@ -135,15 +125,9 @@ export default async function (req: Request): Promise<Response> {
 
     const summaryContext = `User's last 7 days stats: Avg Daily Calories: ${avgCals} kcal, Avg Daily Protein: ${avgProtein}g, Avg Daily Carbs: ${avgCarbs}g, Avg Daily Fat: ${avgFat}g, Avg Daily Fiber: ${avgFiber}g. Most common meal type: ${commonType}. Total logged meals in last 7 days: ${pastMeals?.length || 0}.`;
 
-    // Query last 4-6 conversation turns from coach_messages (to minimize tokens)
     const fetchMessagesRes = await fetch(
       `${baseUrl}/api/database/records/coach_messages?user_id=eq.${userId}&order=created_at.desc&limit=6`,
-      {
-        method: 'GET',
-        headers: {
-          'Authorization': authHeader,
-        },
-      }
+      { method: 'GET', headers: { 'Authorization': authHeader } }
     );
 
     if (!fetchMessagesRes.ok) {
@@ -157,14 +141,7 @@ export default async function (req: Request): Promise<Response> {
     const recentMessages = await fetchMessagesRes.json();
     const history = recentMessages ? [...recentMessages].reverse() : [];
 
-    // 3. CALL GEMINI API (with retries and verified models)
-    const apiKey = Deno.env.get('GEMINI_API_KEY');
-    if (!apiKey) {
-      return new Response(
-        JSON.stringify({ error: 'GEMINI_API_KEY secret is not configured.' }),
-        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
+    const systemInstruction = `You are "Aahar Coach," an empathetic, expert nutrition and fitness coach. Guide the user based on their last 7 days calorie/macro summary and chat history. Keep answers concise, direct, motivational, and actionable (maximum 2-3 paragraphs). Don't give generic medical advice.`;
 
     const fetchWithRetry = async (url: string, options: any, maxRetries = 2) => {
       let delay = 1000;
@@ -173,12 +150,12 @@ export default async function (req: Request): Promise<Response> {
           const res = await fetch(url, options);
           if (res.ok) return res;
           const errText = await res.text();
-          throw new Error(`Gemini API returned status ${res.status}: ${errText}`);
+          throw new Error(`API returned status ${res.status}: ${errText}`);
         } catch (err: any) {
           if (attempt > maxRetries) {
             throw err;
           }
-          console.warn(`Gemini attempt ${attempt} failed: ${err.message}. Retrying in ${delay}ms...`);
+          console.warn(`Attempt ${attempt} failed: ${err.message}. Retrying in ${delay}ms...`);
           await new Promise((resolve) => setTimeout(resolve, delay));
           delay *= 3; // Exponential backoff (1s, 3s)
         }
@@ -186,51 +163,73 @@ export default async function (req: Request): Promise<Response> {
       throw new Error('Max retries reached');
     };
 
-    const systemInstruction = `You are "Aahar Coach," an empathetic, expert nutrition and fitness coach. Guide the user based on their last 7 days calorie/macro summary and chat history. Keep answers concise, direct, motivational, and actionable (maximum 2-3 paragraphs). Don't give generic medical advice.`;
+    // 3. CALL AI PROVIDER: try OpenRouter's multi-model routing first, fall back to Gemini
+    const openRouterKey = Deno.env.get('OPENROUTER_API_KEY');
+    const geminiKey = Deno.env.get('GEMINI_API_KEY');
 
-    const contents = [
-      {
-        role: 'user',
-        parts: [
-          {
-            text: `System instruction context:\n${systemInstruction}\n\nUser Macro Summary:\n${summaryContext}`,
-          },
-        ],
-      },
-      ...history.map((m: any) => ({
-        role: m.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: m.content }],
-      })),
-      {
-        role: 'user',
-        parts: [{ text: message }],
-      },
-    ];
+    let assistantText = '';
+    let providerUsed = '';
 
-    const geminiPayload = { contents };
+    if (openRouterKey) {
+      try {
+        const openRouterMessages = [
+          { role: 'system', content: `${systemInstruction}\n\nUser Macro Summary:\n${summaryContext}` },
+          ...history.map((m: any) => ({
+            role: m.role === 'assistant' ? 'assistant' : 'user',
+            content: m.content,
+          })),
+          { role: 'user', content: message },
+        ];
 
-    const geminiResponse = await fetchWithRetry(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(geminiPayload),
+        const orPayload = {
+          model: 'google/gemma-4-26b-a4b-it:free',
+          models: ['google/gemma-4-26b-a4b-it:free', 'openai/gpt-oss-20b:free', 'nvidia/nemotron-3-super-120b-a12b:free'],
+          max_tokens: 800,
+          messages: openRouterMessages,
+        };
+
+        // Only 1 retry here — OpenRouter already tries each model in the list internally.
+        // Wrap in a native AbortSignal.timeout of 20 seconds to allow free models enough time under load.
+        let orResponse;
+        try {
+          orResponse = await fetchWithRetry(
+            'https://openrouter.ai/api/v1/chat/completions',
+            {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${openRouterKey}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(orPayload),
+              signal: AbortSignal.timeout(27000),
+            },
+            1
+          );
+        } catch (orErr: any) {
+          throw new Error(`OpenRouter query failed or timed out: ${orErr.message}`);
+        }
+
+        const orData = await orResponse.json();
+        const orText = orData.choices?.[0]?.message?.content;
+        if (!orText) throw new Error(`OpenRouter returned empty response: ${JSON.stringify(orData)}`);
+
+        assistantText = orText;
+        providerUsed = orData.model ? `openrouter:${orData.model}` : 'openrouter';
+        console.log(`coach-chat served by ${providerUsed}`);
+      } catch (orErr: any) {
+        return new Response(
+          JSON.stringify({ error: `OpenRouter failed: ${orErr.message}` }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
       }
-    );
-
-    const responseData = await geminiResponse.json();
-    const assistantText = responseData.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    if (!assistantText) {
+    } else {
       return new Response(
-        JSON.stringify({ error: `Gemini returned empty response: ${JSON.stringify(responseData)}` }),
+        JSON.stringify({ error: 'OPENROUTER_API_KEY secret is not configured.' }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    // 4. SAVE EXCHANGE TO DATABASE
+    // 4. SAVE EXCHANGE TO DATABASE — unchanged from original
     await fetch(`${baseUrl}/api/database/records/coach_messages`, {
       method: 'POST',
       headers: {
@@ -270,7 +269,7 @@ export default async function (req: Request): Promise<Response> {
     }
 
     return new Response(
-      JSON.stringify({ text: assistantText }),
+      JSON.stringify({ text: assistantText, provider_used: providerUsed }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error: any) {

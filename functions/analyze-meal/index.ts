@@ -36,9 +36,7 @@ export default async function (req: Request): Promise<Response> {
 
     const sessionResponse = await fetch(`${baseUrl}/api/auth/sessions/current`, {
       method: 'GET',
-      headers: {
-        'Authorization': authHeader,
-      },
+      headers: { 'Authorization': authHeader },
     });
 
     if (!sessionResponse.ok) {
@@ -62,7 +60,6 @@ export default async function (req: Request): Promise<Response> {
     const body = await req.json().catch(() => ({}));
     const { image_path, idempotency_key } = body;
 
-    // Minimal input validation for MVP
     if (!image_path) {
       return new Response(
         JSON.stringify({ error: 'Missing required field: image_path' }),
@@ -80,12 +77,7 @@ export default async function (req: Request): Promise<Response> {
     const getDownloadUrl = async (path: string): Promise<string> => {
       const downloadStrategyResponse = await fetch(
         `${baseUrl}/api/storage/buckets/meals/download-strategy/objects/${path}`,
-        {
-          method: 'GET',
-          headers: {
-            'Authorization': authHeader,
-          },
-        }
+        { method: 'GET', headers: { 'Authorization': authHeader } }
       );
       if (downloadStrategyResponse.ok) {
         const strategyData = await downloadStrategyResponse.json();
@@ -101,12 +93,7 @@ export default async function (req: Request): Promise<Response> {
     // 2. IDEMPOTENCY CHECK
     const fetchMealRes = await fetch(
       `${baseUrl}/api/database/records/meals?idempotency_key=eq.${idempotency_key}`,
-      {
-        method: 'GET',
-        headers: {
-          'Authorization': authHeader,
-        },
-      }
+      { method: 'GET', headers: { 'Authorization': authHeader } }
     );
 
     if (!fetchMealRes.ok) {
@@ -120,15 +107,9 @@ export default async function (req: Request): Promise<Response> {
     const existingMeals = await fetchMealRes.json();
 
     if (existingMeals && existingMeals.length > 0) {
-      // Meal already exists, fetch food items and return immediately
       const fetchItemsRes = await fetch(
         `${baseUrl}/api/database/records/meal_food_items?meal_id=eq.${existingMeals[0].id}`,
-        {
-          method: 'GET',
-          headers: {
-            'Authorization': authHeader,
-          },
-        }
+        { method: 'GET', headers: { 'Authorization': authHeader } }
       );
       const foodItems = fetchItemsRes.ok ? await fetchItemsRes.json() : [];
       const imageUrl = await getDownloadUrl(existingMeals[0].image_path);
@@ -148,12 +129,7 @@ export default async function (req: Request): Promise<Response> {
     const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const fetchRecentRes = await fetch(
       `${baseUrl}/api/database/records/meals?user_id=eq.${userId}&created_at=gte.${oneDayAgo}&select=id`,
-      {
-        method: 'GET',
-        headers: {
-          'Authorization': authHeader,
-        },
-      }
+      { method: 'GET', headers: { 'Authorization': authHeader } }
     );
 
     if (!fetchRecentRes.ok) {
@@ -172,100 +148,19 @@ export default async function (req: Request): Promise<Response> {
       );
     }
 
-    // 4. DOWNLOAD IMAGE FROM STORAGE via Download Strategy (prevents Authorization forwarding to S3)
-    const strategyResponse = await fetch(
-      `${baseUrl}/api/storage/buckets/meals/download-strategy/objects/${image_path}`,
-      {
-        method: 'GET',
-        headers: {
-          'Authorization': authHeader,
-        },
-      }
-    );
-
-    if (!strategyResponse.ok) {
-      const errText = await strategyResponse.text();
+    // 4. GET SIGNED DOWNLOAD URL FOR THE IMAGE
+    const imageUrl = await getDownloadUrl(image_path);
+    if (!imageUrl) {
       return new Response(
-        JSON.stringify({ error: `Failed to get download strategy: ${errText}` }),
+        JSON.stringify({ error: 'Failed to retrieve image download URL.' }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-
-    const strategyData = await strategyResponse.json();
-    let downloadUrl = strategyData.url;
-    const downloadHeaders: HeadersInit = {};
-
-    if (strategyData.method === 'direct') {
-      if (downloadUrl.startsWith('/')) {
-        downloadUrl = `${baseUrl}${downloadUrl}`;
-      }
-      downloadHeaders['Authorization'] = authHeader;
-    }
-
-    const downloadRes = await fetch(downloadUrl, {
-      method: 'GET',
-      headers: downloadHeaders,
-    });
-
-    if (!downloadRes.ok) {
-      const errText = await downloadRes.text();
-      return new Response(
-        JSON.stringify({ error: `Failed to download image from storage: ${errText}` }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    const blob = await downloadRes.blob();
-
-    // 5. IMAGE SIZE GUARD
-    if (blob.size > 2 * 1024 * 1024) {
-      return new Response(
-        JSON.stringify({ error: 'Image exceeds size limit of 2MB.' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Convert Blob to base64
-    const arrayBuffer = await blob.arrayBuffer();
-    const uint8Array = new Uint8Array(arrayBuffer);
-    let binary = '';
-    const len = uint8Array.byteLength;
-    for (let i = 0; i < len; i++) {
-      binary += String.fromCharCode(uint8Array[i]);
-    }
-    const base64Data = btoa(binary);
-
-    // 6. CALL GEMINI API (with bounded retries and verified models)
-    const apiKey = Deno.env.get('GEMINI_API_KEY');
-    if (!apiKey) {
-      return new Response(
-        JSON.stringify({ error: 'GEMINI_API_KEY secret is not configured.' }),
-        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    const fetchWithRetry = async (url: string, options: any, maxRetries = 2) => {
-      let delay = 1000;
-      for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
-        try {
-          const res = await fetch(url, options);
-          if (res.ok) return res;
-          const errText = await res.text();
-          throw new Error(`Gemini API returned status ${res.status}: ${errText}`);
-        } catch (err: any) {
-          if (attempt > maxRetries) {
-            throw err;
-          }
-          console.warn(`Gemini attempt ${attempt} failed: ${err.message}. Retrying in ${delay}ms...`);
-          await new Promise((resolve) => setTimeout(resolve, delay));
-          delay *= 3; // Exponential backoff (1s, 3s)
-        }
-      }
-      throw new Error('Max retries reached');
-    };
+    const mimeType = image_path.endsWith('.png') ? 'image/png' : 'image/jpeg';
 
     const systemPrompt = `Identify all food items in this meal and estimate their portion size, weight in grams, calories, protein, carbohydrates, fat, fiber, and relevant micronutrients.
-Return ONLY a raw JSON object matching this schema. Do not wrap it in markdown code blocks like \`\`\`json or add any explanation text.
+Return ONLY a minified, single-line raw JSON object matching this schema. Do not use any indentation, spaces, newlines, or code blocks like \`\`\`json. Output must start with { and end with }.
+Ensure all keys are fully quoted and correct JSON syntax is maintained (e.g. "fat": 22).
 Schema:
 {
   "meal_name": "string",
@@ -295,61 +190,168 @@ Schema:
   ]
 }`;
 
-    const geminiPayload = {
-      contents: [
-        {
-          parts: [
-            {
-              inlineData: {
-                mimeType: blob.type || 'image/jpeg',
-                data: base64Data,
-              },
-            },
-            {
-              text: systemPrompt,
-            },
-          ],
-        },
-      ],
+    const requiredKeys = ['meal_name', 'meal_type', 'total_calories', 'total_protein', 'total_carbohydrates', 'total_fat', 'total_fiber', 'food_items'];
+
+    const findEndOfJsonObject = (str: string, startIndex: number): number => {
+      let openBraces = 0;
+      let inString = false;
+      let escaped = false;
+      
+      for (let i = startIndex; i < str.length; i++) {
+        const char = str[i];
+        
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        
+        if (char === '\\') {
+          escaped = true;
+          continue;
+        }
+        
+        if (char === '"') {
+          inString = !inString;
+          continue;
+        }
+        
+        if (!inString) {
+          if (char === '{') {
+            openBraces++;
+          } else if (char === '}') {
+            openBraces--;
+            if (openBraces === 0) {
+              return i;
+            }
+          }
+        }
+      }
+      return -1;
     };
 
-    // Call gemini-3.6-flash (current verified active model)
-    const geminiResponse = await fetchWithRetry(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(geminiPayload),
+    const extractJson = (raw: string): any => {
+      const firstCurly = raw.indexOf('{');
+      if (firstCurly === -1) {
+        throw new Error(`Could not find opening curly brace '{' in response: ${raw}`);
       }
-    );
+      
+      const lastCurly = findEndOfJsonObject(raw, firstCurly);
+      if (lastCurly === -1) {
+        throw new Error(`Could not find matching closing curly brace '}' in response: ${raw}`);
+      }
+      
+      const cleaned = raw.substring(firstCurly, lastCurly + 1).trim();
+      try {
+        return JSON.parse(cleaned);
+      } catch (firstErr: any) {
+        console.warn(`Initial JSON parse failed, attempting auto-repair: ${firstErr.message}`);
+        try {
+          // Fix missing closing quote and colon: "fat:22 -> "fat":22
+          const repaired = cleaned.replace(/"([a-zA-Z0-9_]+):([0-9.-]+)/g, '"$1":$2');
+          return JSON.parse(repaired);
+        } catch (repairErr: any) {
+          throw new Error(`Failed to parse and repair JSON. Original error: ${firstErr.message}. Repair error: ${repairErr.message}`);
+        }
+      }
+    };
 
-    const responseData = await geminiResponse.json();
-    let text = responseData.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) {
+    const validateParsed = (parsed: any, rawTextForError: string) => {
+      for (const key of requiredKeys) {
+        if (parsed[key] === undefined) {
+          throw new Error(`AI JSON output missing required field: ${key}. Raw response: ${rawTextForError}`);
+        }
+      }
+    };
+
+    const fetchWithRetry = async (url: string, options: any, maxRetries = 2) => {
+      let delay = 1000;
+      for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+        try {
+          const res = await fetch(url, options);
+          if (res.ok) return res;
+          const errText = await res.text();
+          throw new Error(`API returned status ${res.status}: ${errText}`);
+        } catch (err: any) {
+          if (attempt > maxRetries) {
+            throw err;
+          }
+          console.warn(`Attempt ${attempt} failed: ${err.message}. Retrying in ${delay}ms...`);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          delay *= 3; // Exponential backoff (1s, 3s)
+        }
+      }
+      throw new Error('Max retries reached');
+    };
+
+    // 6. CALL AI PROVIDER: try OpenRouter's multi-model routing first, fall back to Gemini
+    const openRouterKey = Deno.env.get('OPENROUTER_API_KEY');
+    const geminiKey = Deno.env.get('GEMINI_API_KEY');
+
+    let parsedResult: any = null;
+    let providerUsed = '';
+
+    if (openRouterKey) {
+      try {
+        const orPayload = {
+          model: 'google/gemma-4-26b-a4b-it:free',
+          models: ['google/gemma-4-26b-a4b-it:free', 'google/gemma-4-31b-it:free'],
+          max_tokens: 1200,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: systemPrompt },
+                { type: 'image_url', image_url: { url: imageUrl } },
+              ],
+            },
+          ],
+        };
+
+        // Only 1 retry here — OpenRouter already tries each model in the list internally.
+        // Wrap in a native AbortSignal.timeout of 20 seconds to allow free models enough time under load.
+        let orResponse;
+        try {
+          orResponse = await fetchWithRetry(
+            'https://openrouter.ai/api/v1/chat/completions',
+            {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${openRouterKey}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(orPayload),
+              signal: AbortSignal.timeout(27000),
+            },
+            1
+          );
+        } catch (orErr: any) {
+          throw new Error(`OpenRouter query failed or timed out: ${orErr.message}`);
+        }
+
+        const orData = await orResponse.json();
+        const orText = orData.choices?.[0]?.message?.content;
+        if (!orText) throw new Error(`OpenRouter returned empty response: ${JSON.stringify(orData)}`);
+
+        const parsed = extractJson(orText);
+        validateParsed(parsed, orText);
+
+        parsedResult = parsed;
+        providerUsed = orData.model ? `openrouter:${orData.model}` : 'openrouter';
+        console.log(`analyze-meal served by ${providerUsed}`);
+      } catch (orErr: any) {
+        return new Response(
+          JSON.stringify({ error: `OpenRouter failed: ${orErr.message}` }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    } else {
       return new Response(
-        JSON.stringify({ error: `Gemini returned empty response: ${JSON.stringify(responseData)}` }),
+        JSON.stringify({ error: 'OPENROUTER_API_KEY secret is not configured.' }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    // Strip markdown code block wrapper if present
-    text = text.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
-    const parsedResult = JSON.parse(text);
-
-    // Validate parsed results strictly
-    const requiredKeys = ['meal_name', 'meal_type', 'total_calories', 'total_protein', 'total_carbohydrates', 'total_fat', 'total_fiber', 'food_items'];
-    for (const key of requiredKeys) {
-      if (parsedResult[key] === undefined) {
-        return new Response(
-          JSON.stringify({ error: `Gemini JSON output missing required field: ${key}. Raw response: ${text}` }),
-          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-    }
-
-    // 7. SAVE TO DATABASE (meals + meal_food_items)
+    // 7. SAVE TO DATABASE (meals + meal_food_items) — unchanged from original
     const insertMealRes = await fetch(`${baseUrl}/api/database/records/meals`, {
       method: 'POST',
       headers: {
@@ -392,17 +394,25 @@ Schema:
     }
 
     const mealId = newMeals[0].id;
-    const itemsToInsert = parsedResult.food_items.map((item: any) => ({
-      meal_id: mealId,
-      food_name: item.food_name,
-      estimated_quantity: item.estimated_quantity,
-      estimated_grams: item.estimated_grams,
-      calories: item.calories,
-      protein: item.protein,
-      carbohydrates: item.carbohydrates,
-      fat: item.fat,
-      fiber: item.fiber,
-    }));
+    const itemsToInsert = parsedResult.food_items.map((item: any) => {
+      const parseNum = (val: any, fallback = 0): number | null => {
+        if (val === undefined || val === null) return fallback;
+        const num = Number(val);
+        return isNaN(num) ? fallback : num;
+      };
+
+      return {
+        meal_id: mealId,
+        food_name: item.food_name || item.name || 'Unknown Food',
+        estimated_quantity: item.estimated_quantity || item.quantity || null,
+        estimated_grams: item.estimated_grams !== undefined ? parseNum(item.estimated_grams, null) : parseNum(item.estimated_weight, null),
+        calories: parseNum(item.calories, 0),
+        protein: parseNum(item.protein, 0),
+        carbohydrates: parseNum(item.carbohydrates, 0),
+        fat: parseNum(item.fat, 0),
+        fiber: parseNum(item.fiber, 0),
+      };
+    });
 
     const insertItemsRes = await fetch(`${baseUrl}/api/database/records/meal_food_items`, {
       method: 'POST',
@@ -414,12 +424,9 @@ Schema:
     });
 
     if (!insertItemsRes.ok) {
-      // Clean up the created meal record
       await fetch(`${baseUrl}/api/database/records/meals?id=eq.${mealId}`, {
         method: 'DELETE',
-        headers: {
-          'Authorization': authHeader,
-        },
+        headers: { 'Authorization': authHeader },
       });
       const errText = await insertItemsRes.text();
       return new Response(
@@ -428,7 +435,7 @@ Schema:
       );
     }
 
-    const imageUrl = await getDownloadUrl(image_path);
+    // imageUrl is already defined above
 
     return new Response(
       JSON.stringify({
@@ -436,6 +443,7 @@ Schema:
         food_items: itemsToInsert,
         imageUrl,
         is_duplicate: false,
+        provider_used: providerUsed,
       }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );

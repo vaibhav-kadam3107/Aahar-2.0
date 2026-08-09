@@ -744,7 +744,8 @@
           <div class="analysis-layout">
             <div>
               <h4 id="resMealName" style="font-size: 1.25rem; font-weight: 700; margin-bottom: 8px;">Meal Name</h4>
-              <p id="resMealType" style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 24px;">Type: Breakfast</p>
+              <p id="resMealType" style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 8px;">Type: Breakfast</p>
+              <p id="resMealProvider" style="color: var(--primary); font-size: 0.85rem; font-weight: 500; margin-bottom: 24px; font-family: 'JetBrains Mono', monospace;"></p>
 
               <div class="macro-chips">
                 <div class="macro-chip">
@@ -1245,6 +1246,7 @@
 
       document.getElementById('resMealName').innerText = meal.meal_name;
       document.getElementById('resMealType').innerText = `Type: ${meal.meal_type}`;
+      document.getElementById('resMealProvider').innerText = data.provider_used ? `AI Model: ${data.provider_used}` : '';
       document.getElementById('resCalories').innerText = Math.round(meal.total_calories);
       document.getElementById('resProtein').innerText = `${Math.round(meal.total_protein)}g`;
       document.getElementById('resCarbs').innerText = `${Math.round(meal.total_carbohydrates)}g`;
@@ -1492,7 +1494,7 @@
         }
 
         const data = await res.json();
-        appendMessage(data.text, 'coach');
+        appendMessage(data.text, 'coach', data.provider_used);
       } catch (err) {
         console.error("Coach chat error", err);
         appendMessage(`Error: ${err.message || 'Failed to connect to Coach Chat'}`, 'coach');
@@ -1501,11 +1503,21 @@
       }
     }
 
-    function appendMessage(text, sender) {
+    function appendMessage(text, sender, provider = null) {
       const chatMessages = document.getElementById('chatMessages');
       const bubble = document.createElement('div');
       bubble.className = `chat-bubble ${sender}`;
       bubble.innerText = text;
+      
+      if (provider) {
+        const footnote = document.createElement('div');
+        footnote.style.fontSize = '0.75rem';
+        footnote.style.color = 'rgba(255,255,255,0.4)';
+        footnote.style.marginTop = '6px';
+        footnote.style.fontFamily = "'JetBrains Mono', monospace";
+        footnote.innerText = `served by ${provider}`;
+        bubble.appendChild(footnote);
+      }
       
       chatMessages.appendChild(bubble);
       chatMessages.scrollTop = chatMessages.scrollHeight;
