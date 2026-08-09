@@ -1,0 +1,20 @@
+
+# InsForge & AI agent skills
+.insforge
+.agent
+.agents
+.augment
+.claude
+.cline
+.github/copilot*
+.kilocode
+.qoder
+.qwen
+.roo
+.trae
+.windsurf
+node_modules/
+scratch_invoke.js
+scratch_test.js
+scratch_test.html
+salad_meal.png
